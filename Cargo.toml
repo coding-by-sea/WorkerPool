@@ -1,0 +1,9 @@
+[package]
+name = "WorkerPool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.54.1", features = ["full"] }
+crossbeam-queue = "0.3.14"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }

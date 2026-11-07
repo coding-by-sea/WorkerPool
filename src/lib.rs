@@ -42,11 +42,10 @@ use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::atomic::fence;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use crossbeam_queue::ArrayQueue;
+use concurrent_queue::{ConcurrentQueue, PushError};
 use futures_util::FutureExt;
 use tokio::select;
 use tokio::sync::{Semaphore, oneshot};
@@ -67,7 +66,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Job = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct Worker {
-    work_queue: Arc<ArrayQueue<Job>>,
+    work_queue: Arc<ConcurrentQueue<Job>>,
     /// One permit per job sitting in `work_queue`.
     queued: Arc<Semaphore>,
     /// One permit per free slot in `work_queue`.
@@ -78,7 +77,7 @@ struct Worker {
 
 impl Worker {
     fn new(
-        work_queue: Arc<ArrayQueue<Job>>,
+        work_queue: Arc<ConcurrentQueue<Job>>,
         queued: Arc<Semaphore>,
         slots: Arc<Semaphore>,
         retiring: Arc<Semaphore>,
@@ -119,7 +118,7 @@ impl Worker {
                     // only be empty here if the pool closed and drained it
                     // after we got the permit, so stop instead of running
                     // anything else.
-                    let Some(job) = self.work_queue.pop() else {
+                    let Ok(job) = self.work_queue.pop() else {
                         break;
                     };
                     self.slots.add_permits(1);
@@ -137,7 +136,7 @@ impl Worker {
 /// After shutdown, `submit` on any handle returns `WorkerPoolClosed`.
 #[derive(Clone)]
 pub struct Submitter {
-    work_queue: Arc<ArrayQueue<Job>>,
+    work_queue: Arc<ConcurrentQueue<Job>>,
     /// One permit per job sitting in `work_queue`.
     queued: Arc<Semaphore>,
     /// One permit per free slot in `work_queue`.
@@ -188,32 +187,29 @@ impl Submitter {
             let _ = tx.send(result); // receiver may have been dropped; that's fine
         });
 
-        // Only add a permit if the job actually made it into the queue, so
-        // permits and queued jobs always match.
-        if self.work_queue.push(job).is_ok() {
-            self.queued.add_permits(1); // wakes one sleeping worker
-            permit.forget();
-        }
-
         // TODO: add a deterministic test for a `submit` that races with
         // `close`. It needs a `#[cfg(test)]` pause point between acquiring
         // the slot and pushing: pause there, close the pool, resume, and check
-        // the caller gets an error instead of waiting forever.
-        //
-        // If the pool closed while we were pushing, its drain may have run
-        // before our job landed. Drain again so the job doesn't sit in the
-        // queue forever. The fence pairs with the one in `TaskPool::close`:
-        // either it sees our job, or we see that it closed.
-        fence(SeqCst);
-        if self.slots.is_closed() {
-            self.drain();
+        // the caller gets `WorkerPoolClosed` instead of waiting forever.
+        match self.work_queue.push(job) {
+            Ok(()) => {
+                // The job now holds this slot until a worker pops it.
+                permit.forget();
+                self.queued.add_permits(1); // wakes one sleeping worker
+                Ok(rx)
+            }
+            // The pool closed after we got a slot. A closed queue rejects
+            // every push, so no job can land after `close` has drained it.
+            Err(PushError::Closed(_)) => Err(TaskError::WorkerPoolClosed),
+            Err(PushError::Full(_)) => {
+                unreachable!("holding a slot permit guarantees space in the queue")
+            }
         }
-        Ok(rx)
     }
 
     /// Drop every job still in the queue. Each one's caller gets a `RecvError`.
     fn drain(&self) {
-        while self.work_queue.pop().is_some() {}
+        while self.work_queue.pop().is_ok() {}
     }
 }
 
@@ -229,7 +225,7 @@ impl TaskPool {
     /// `max_concurrency` workers running jobs.
     pub fn new(capacity: usize, max_concurrency: usize) -> Self {
         let submitter = Submitter {
-            work_queue: Arc::new(ArrayQueue::new(capacity)),
+            work_queue: Arc::new(ConcurrentQueue::bounded(capacity)),
             queued: Arc::new(Semaphore::new(0)), // queue starts empty
             slots: Arc::new(Semaphore::new(capacity)),
             retiring: Arc::new(Semaphore::new(0)),
@@ -306,11 +302,11 @@ impl TaskPool {
     fn close(&self) {
         self.submitter.slots.close(); // new submits on any handle get WorkerPoolClosed
         self.submitter.queued.close(); // idle workers wake up and exit
+        self.submitter.work_queue.close(); // pushes already past `slots` fail
 
-        // Pairs with the fence in `Submitter::submit`; see the comment there.
-        fence(SeqCst);
         // Drop queued jobs now, even if producers still hold handles that
-        // keep the queue itself alive.
+        // keep the queue itself alive. The queue is closed, so nothing can be
+        // pushed after this drain.
         self.submitter.drain();
     }
 }
@@ -338,7 +334,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
 
     /// Shrinking while every worker is busy leaves `retiring` permits unused.
     /// Growing back before anyone retires should take those permits back

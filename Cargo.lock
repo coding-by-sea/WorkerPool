@@ -6,7 +6,7 @@ version = 4
 name = "WorkerPool"
 version = "0.1.0"
 dependencies = [
- "crossbeam-queue",
+ "concurrent-queue",
  "futures-util",
  "tokio",
 ]
@@ -30,10 +30,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
-name = "crossbeam-queue"
-version = "0.3.14"
+name = "concurrent-queue"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
 ]
